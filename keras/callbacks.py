@@ -251,13 +251,13 @@ class CallbackList:
       elif isinstance(cb, History):
         self._history = cb
 
-    if self._progbar is None and add_progbar:
-      self._progbar = ProgbarLogger(count_mode='steps')
-      self.callbacks.insert(0, self._progbar)
-
     if self._history is None and add_history:
       self._history = History()
       self.callbacks.append(self._history)
+
+    if self._progbar is None and add_progbar:
+      self._progbar = ProgbarLogger(count_mode='steps')
+      self.callbacks.append(self._progbar)
 
   def _process_logs(self, logs, is_batch_hook=False):
     """Turns tensors into numpy arrays or Python scalars if necessary."""
@@ -1587,26 +1587,35 @@ class ModelCheckpoint(Callback):
 class BackupAndRestore(Callback):
   """Callback to back up and restore the training state.
 
-  `BackupAndRestore` callback is intended to recover from interruptions that
-  happened in the middle of a model.fit execution by backing up the
-  training states in a temporary checkpoint file (based on TF CheckpointManager)
-  at the end of each epoch. If training restarted before completion, the
-  training state and model are restored to the most recently saved state at the
-  beginning of a new model.fit() run.
-  Note that user is responsible to bring jobs back up.
+  `BackupAndRestore` callback is intended to recover training from an
+  interruption that has happened in the middle of a `Model.fit` execution, by
+  backing up the training states in a temporary checkpoint file (with the help
+  of a `tf.train.CheckpointManager`), at the end of each epoch. Each backup
+  overwrites the previously written checkpoint file, so at any given time there
+  is at most one such checkpoint file for backup/restoring purpose.
+
+  If training restarts before completion, the training state (which includes the
+  `Model` weights and epoch number) is restored to the most recently saved state
+  at the beginning of a new `Model.fit` run. At the completion of a `Model.fit`
+  run, the temporary checkpoint file is deleted.
+
+  Note that the user is responsible to bring jobs back after the interruption.
   This callback is important for the backup and restore mechanism for fault
-  tolerance purpose. And the model to be restored from an previous checkpoint is
+  tolerance purpose, and the model to be restored from an previous checkpoint is
   expected to be the same as the one used to back up. If user changes arguments
   passed to compile or fit, the checkpoint saved for fault tolerance can become
   invalid.
 
   Note:
-  1. This callback is not compatible with disabling eager execution.
-  2. A checkpoint is saved at the end of each epoch, when restoring we'll redo
-  any partial work from an unfinished epoch in which the training got restarted
-  (so the work done before a interruption doesn't affect the final model state).
-  3. This works for both single worker and multi-worker mode, only
-  MirroredStrategy and MultiWorkerMirroredStrategy are supported for now.
+  1. This callback is not compatible with eager execution disabled.
+  2. A checkpoint is saved at the end of each epoch. After restoring,
+  `Model.fit` redoes any partial work during the unfinished epoch in which the
+  training got restarted (so the work done before the interruption doesn't
+  affect the final model state).
+  3. This works for both single worker and multi-worker modes. When `Model.fit`
+  is used with `tf.distribute`, it supports `tf.distribute.MirroredStrategy`,
+  `tf.distribute.MultiWorkerMirroredStrategy`, `tf.distribute.TPUStrategy`, and
+  `tf.distribute.experimental.ParameterServerStrategy`.
 
   Example:
 
@@ -1782,7 +1791,8 @@ class EarlyStopping(Callback):
     elif mode == 'max':
       self.monitor_op = np.greater
     else:
-      if 'acc' in self.monitor:
+      if (self.monitor.endswith('acc') or self.monitor.endswith('accuracy') or
+          self.monitor.endswith('auc')):
         self.monitor_op = np.greater
       else:
         self.monitor_op = np.less
@@ -2072,8 +2082,7 @@ class TensorBoard(Callback, version_utils.TensorBoardVersionSelector):
       profile_batch: Profile the batch(es) to sample compute characteristics.
         profile_batch must be a non-negative integer or a tuple of integers.
         A pair of positive integers signify a range of batches to profile.
-        By default, it will profile the second batch. Set profile_batch=0
-        to disable profiling.
+        By default, profiling is disabled.
       embeddings_freq: frequency (in epochs) at which embedding layers will be
         visualized. If set to 0, embeddings won't be visualized.
       embeddings_metadata: Dictionary which maps embedding layer names to the
@@ -2158,7 +2167,7 @@ class TensorBoard(Callback, version_utils.TensorBoardVersionSelector):
                write_images=False,
                write_steps_per_second=False,
                update_freq='epoch',
-               profile_batch=2,
+               profile_batch=0,
                embeddings_freq=0,
                embeddings_metadata=None,
                **kwargs):

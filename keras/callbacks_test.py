@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 
 from absl.testing import parameterized
 import numpy as np
@@ -324,6 +325,8 @@ class KerasCallbacksTest(keras_parameterized.TestCase):
       model.fit(np.ones((10, 1)), np.ones((10, 1)), epochs=0, callbacks=[cbk])
 
   def test_backup_restore_train_counter(self):
+    if not tf.compat.v1.executing_eagerly():
+      self.skipTest('BackupAndRestore only available when execution is enabled')
     model = keras.Sequential([keras.layers.Dense(1)])
     model.compile('sgd', 'mse')
     cbk = BackupAndRestore(self.get_temp_dir())
@@ -523,6 +526,8 @@ class KerasCallbacksTest(keras_parameterized.TestCase):
     model_type = testing_utils.get_model_type()
     if model_type == 'subclass':
       return  # Skip test since subclassed models cannot be saved in .h5 format.
+    if not tf.__internal__.tf2.enabled():
+      self.skipTest('Checkpoint callback only available in v2.')
 
     layers = [
         keras.layers.Dense(NUM_HIDDEN, input_dim=INPUT_DIM, activation='relu'),
@@ -1118,7 +1123,7 @@ class KerasCallbacksTest(keras_parameterized.TestCase):
             1, activation='sigmoid'),))
     model.compile(
         optimizer='sgd', loss='binary_crossentropy', metrics=['accuracy'])
-    expected_log = r'(.*- loss:.*- accuracy:.*epoch)+'
+    expected_log = r'(.*- loss:.*- acc.*:.*epoch)+'
     with self.captureWritesToStream(sys.stdout) as printed:
       model.fit(data, labels, verbose=2, epochs=20)
       self.assertRegex(printed.contents(), expected_log)
@@ -2037,6 +2042,28 @@ class KerasCallbacksTest(keras_parameterized.TestCase):
     model.fit(x, y, batch_size=2, callbacks=[my_cb])
     self.assertEqual(my_cb.batch_counter, 3)
 
+  @keras_parameterized.run_all_keras_modes(always_skip_v1=True)
+  def test_built_in_callback_order(self):
+
+    class CustomCallback(keras.callbacks.Callback):
+      pass
+
+    class TestingCallbackList(keras.callbacks.CallbackList):
+
+      def __init__(self, *args, **kwargs):
+        super(TestingCallbackList, self).__init__(*args, **kwargs)
+        if ((not isinstance(self.callbacks[0], CustomCallback)) or
+            (not isinstance(self.callbacks[1], keras.callbacks.History)) or
+            (not isinstance(self.callbacks[2], keras.callbacks.ProgbarLogger))):
+          raise AssertionError(f'Callback order unexpected: {self.callbacks}')
+
+    with mock.patch.object(
+        keras.callbacks, 'CallbackList', TestingCallbackList):
+      model = keras.Sequential([keras.layers.Dense(1)])
+      model.compile('sgd', 'mse')
+      custom_callback = CustomCallback()
+      model.fit(np.ones((10, 10)), np.ones((10, 1)), epochs=5,
+                callbacks=[custom_callback])
 
 # A summary that was emitted during a test. Fields:
 #   logdir: str. The logdir of the FileWriter to which the summary was

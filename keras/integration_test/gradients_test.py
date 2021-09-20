@@ -14,7 +14,7 @@
 # ==============================================================================
 
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v2 as tf
 
 
 class TestKerasModelClass(tf.keras.Model):
@@ -133,4 +133,5 @@ class GradientsTest(tf.test.TestCase):
 
 
 if __name__ == "__main__":
-  tf.test.main()
+  if tf.__internal__.tf2.enabled():
+    tf.test.main()

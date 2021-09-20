@@ -843,31 +843,27 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
       write_scalar_summaries(outputs, step=model._train_counter)  # pylint: disable=protected-access
       return outputs
 
-    if (self._steps_per_execution is None or
-        self._steps_per_execution.numpy().item() == 1):
-
-      def train_function(iterator):
-        """Runs a training execution with one step."""
-        return step_function(self, iterator)
-
-    else:
-
-      def train_function(iterator):
-        """Runs a training execution with multiple steps."""
-        for _ in tf.range(self._steps_per_execution):
+    def train_function(iterator, steps_per_execution):
+      """Runs a training execution with multiple steps."""
+      outputs = step_function(self, iterator)
+      if steps_per_execution > 1:
+        for _ in tf.range(steps_per_execution - 1):
           outputs = step_function(self, iterator)
-        return outputs
+      return outputs
 
     if not self.run_eagerly:
       train_function = tf.function(
           train_function, experimental_relax_shapes=True)
       self.train_tf_function = train_function
 
-    self.train_function = train_function
-
     if self._cluster_coordinator:
-      self.train_function = lambda iterator: self._cluster_coordinator.schedule(  # pylint: disable=g-long-lambda
-          train_function, args=(iterator,))
+      self.train_function = lambda it: self._cluster_coordinator.schedule(  # pylint: disable=g-long-lambda
+          train_function,
+          args=(it, self._steps_per_execution.numpy().item()))
+    else:
+      self.train_function = lambda it: train_function(  # pylint: disable=g-long-lambda
+          it,
+          self._steps_per_execution.numpy().item())
 
     return self.train_function
 
@@ -1113,6 +1109,10 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
         verbose = 2  # Default to epoch-level logging for PSStrategy.
       else:
         verbose = 1  # Default to batch-level logging otherwise.
+    elif verbose == 1 and self.distribute_strategy._should_use_with_coordinator:  # pylint: disable=protected-access
+      raise ValueError(
+          '`verbose=1` is not allowed with `ParameterServerStrategy` for '
+          f'performance reasons. Received: `verbose`={verbose}')
 
     if validation_split:
       # Create the validation data using the training data. Only supported for
@@ -1327,30 +1327,26 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
           outputs, self.distribute_strategy, reduction='first')
       return outputs
 
-    if (self._steps_per_execution is None or
-        self._steps_per_execution.numpy().item() == 1):
-
-      def test_function(iterator):
-        """Runs an evaluation execution with one step."""
-        return step_function(self, iterator)
-
-    else:
-
-      def test_function(iterator):
-        """Runs an evaluation execution with multiple steps."""
-        for _ in tf.range(self._steps_per_execution):
+    def test_function(iterator, steps_per_execution):
+      """Runs an evaluation execution with multiple steps."""
+      outputs = step_function(self, iterator)
+      if steps_per_execution > 1:
+        for _ in tf.range(steps_per_execution - 1):
           outputs = step_function(self, iterator)
-        return outputs
+      return outputs
 
     if not self.run_eagerly:
       test_function = tf.function(
           test_function, experimental_relax_shapes=True)
 
-    self.test_function = test_function
-
     if self._cluster_coordinator:
-      self.test_function = lambda iterator: self._cluster_coordinator.schedule(  # pylint: disable=g-long-lambda
-          test_function, args=(iterator,))
+      self.test_function = lambda it: self._cluster_coordinator.schedule(  # pylint: disable=g-long-lambda
+          test_function,
+          args=(it, self._steps_per_execution.numpy().item()))
+    else:
+      self.test_function = lambda it: test_function(  # pylint: disable=g-long-lambda
+          it,
+          self._steps_per_execution.numpy().item())
 
     return self.test_function
 
@@ -1582,33 +1578,30 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
           outputs, self.distribute_strategy, reduction='concat')
       return outputs
 
-    if (self._steps_per_execution is None or
-        self._steps_per_execution.numpy().item() == 1):
-
-      def predict_function(iterator):
-        """Runs an evaluation execution with one step."""
-        return step_function(self, iterator)
-
-    else:
-
-      def predict_function(iterator):
-        """Runs an evaluation execution with multiple steps."""
-        outputs = step_function(self, iterator)
-        for _ in tf.range(self._steps_per_execution - 1):
+    def predict_function(iterator, steps_per_execution):
+      """Runs an evaluation execution with multiple steps."""
+      outputs = step_function(self, iterator)
+      if steps_per_execution > 1:
+        for _ in tf.range(steps_per_execution - 1):
           tf.autograph.experimental.set_loop_options(
               shape_invariants=[(
                   t, tf_utils.get_tensor_spec(t, dynamic_batch=True).shape)
                                 for t in tf.nest.flatten(outputs)])
           step_outputs = step_function(self, iterator)
-          outputs = tf.nest.map_structure(lambda t1, t2: concat([t1, t2]), outputs,
-                                       step_outputs)
-        return outputs
+          outputs = tf.nest.map_structure(lambda t1, t2: concat([t1, t2]),
+                                          outputs, step_outputs)
+      return outputs
 
     if not self.run_eagerly:
       predict_function = tf.function(
           predict_function, experimental_relax_shapes=True)
 
-    self.predict_function = predict_function
+    steps_per_execution = (
+        lambda: self._steps_per_execution.numpy().item()  # pylint: disable=g-long-lambda
+        if self._steps_per_execution is not None else 1)
+    self.predict_function = lambda it: predict_function(  # pylint: disable=g-long-lambda
+        it, steps_per_execution())
+
     return self.predict_function
 
   @traceback_utils.filter_traceback
@@ -1717,10 +1710,12 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
           options.experimental_distribute.auto_shard_policy = data_option
           x = x.with_options(options)
         except ValueError:
-          warnings.warn('Using Model.predict with '
-                        'MultiWorkerDistributionStrategy or TPUStrategy and '
-                        'AutoShardPolicy.FILE might lead to out-of-order result'
-                        '. Consider setting it to AutoShardPolicy.DATA.')
+          warnings.warn(
+              'Using Model.predict with '
+              'MultiWorkerDistributionStrategy or TPUStrategy and '
+              'AutoShardPolicy.FILE might lead to out-of-order result'
+              '. Consider setting it to AutoShardPolicy.DATA.',
+              stacklevel=2)
 
       data_handler = data_adapter.get_data_handler(
           x=x,
@@ -1975,9 +1970,11 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
       `Model.fit` now supports generators, so there is no longer any need to use
       this endpoint.
     """
-    warnings.warn('`Model.fit_generator` is deprecated and '
-                  'will be removed in a future version. '
-                  'Please use `Model.fit`, which supports generators.')
+    warnings.warn(
+        '`Model.fit_generator` is deprecated and '
+        'will be removed in a future version. '
+        'Please use `Model.fit`, which supports generators.',
+        stacklevel=2)
     return self.fit(
         generator,
         steps_per_epoch=steps_per_epoch,
@@ -2009,9 +2006,11 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
       `Model.evaluate` now supports generators, so there is no longer any need
       to use this endpoint.
     """
-    warnings.warn('`Model.evaluate_generator` is deprecated and '
-                  'will be removed in a future version. '
-                  'Please use `Model.evaluate`, which supports generators.')
+    warnings.warn(
+        '`Model.evaluate_generator` is deprecated and '
+        'will be removed in a future version. '
+        'Please use `Model.evaluate`, which supports generators.',
+        stacklevel=2)
     self._check_call_args('evaluate_generator')
 
     return self.evaluate(
@@ -2038,9 +2037,11 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
       `Model.predict` now supports generators, so there is no longer any need
       to use this endpoint.
     """
-    warnings.warn('`Model.predict_generator` is deprecated and '
-                  'will be removed in a future version. '
-                  'Please use `Model.predict`, which supports generators.')
+    warnings.warn(
+        '`Model.predict_generator` is deprecated and '
+        'will be removed in a future version. '
+        'Please use `Model.predict`, which supports generators.',
+        stacklevel=2)
     return self.predict(
         generator,
         steps=steps,
@@ -2478,9 +2479,11 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     Returns:
         A list of update ops.
     """
-    warnings.warn('`Model.state_updates` will be removed in a future version. '
-                  'This property should not be used in TensorFlow 2.0, '
-                  'as `updates` are applied automatically.')
+    warnings.warn(
+        '`Model.state_updates` will be removed in a future version. '
+        'This property should not be used in TensorFlow 2.0, '
+        'as `updates` are applied automatically.',
+        stacklevel=2)
     state_updates = []
     for layer in self.layers:
       if getattr(layer, 'stateful', False):
@@ -2510,7 +2513,11 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
     weights += (self._trainable_weights + self._non_trainable_weights)
     return weights
 
-  def summary(self, line_length=None, positions=None, print_fn=None):
+  def summary(self,
+              line_length=None,
+              positions=None,
+              print_fn=None,
+              expand_nested=False):
     """Prints a string summary of the network.
 
     Args:
@@ -2524,20 +2531,23 @@ class Model(base_layer.Layer, version_utils.ModelVersionSelector):
             It will be called on each line of the summary.
             You can set it to a custom function
             in order to capture the string summary.
+        expand_nested: Whether to expand the nested models.
+            If not provided, defaults to `False`.
 
     Raises:
         ValueError: if `summary()` is called before the model is built.
     """
     if not self.built:
-      raise ValueError('This model has not yet been built. '
-                       'Build the model first by calling `build()` or calling '
-                       '`fit()` with some data, or specify '
-                       'an `input_shape` argument in the first layer(s) for '
-                       'automatic build.')
-    layer_utils.print_summary(self,
-                              line_length=line_length,
-                              positions=positions,
-                              print_fn=print_fn)
+      raise ValueError(
+          'This model has not yet been built. '
+          'Build the model first by calling `build()` or by calling '
+          'the model on a batch of data.')
+    layer_utils.print_summary(
+        self,
+        line_length=line_length,
+        positions=positions,
+        print_fn=print_fn,
+        expand_nested=expand_nested)
 
   @property
   def layers(self):
